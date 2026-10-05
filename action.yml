@@ -1,0 +1,50 @@
+name: Loopback
+description: Runs Loopback jobs in your GitHub runner (diagnosis, verified fix on a loopback/ branch) and uploads source maps.
+author: Loopback
+branding:
+  icon: check-circle
+  color: gray-dark
+inputs:
+  agent-key:
+    description: Key of the agent's model provider (Anthropic, OpenAI or OpenRouter), stored as the LOOPBACK_AGENT_KEY secret. Required for jobs that use an API key; not needed for Bedrock, Vertex or a Codex login.
+    required: false
+  api-url:
+    description: Loopback API base URL.
+    required: false
+    default: https://api.loopback.so
+  oidc-audience:
+    description: Audience of the GitHub OIDC token. Change it only when your Loopback install verifies another one (GITHUB_OIDC_AUDIENCE); the onboarding pull request writes it for you.
+    required: false
+    default: loopback
+  command:
+    description: "run (default): run the job of the repository_dispatch event. upload-sourcemaps: upload the source maps of a build."
+    required: false
+    default: run
+  sourcemaps-path:
+    description: Directory with the built files and their .map files (upload-sourcemaps).
+    required: false
+    default: dist
+  url-prefix:
+    description: URL path under which the built files are served, e.g. /assets (upload-sourcemaps).
+    required: false
+    default: /
+  release:
+    description: Release name the widget reports (data-release), e.g. the version or the commit SHA (upload-sourcemaps).
+    required: false
+  github-token:
+    description: Optional token used only to fetch git history missing from a shallow checkout. Never given to the agent and never used to push.
+    required: false
+outputs:
+  status:
+    description: Outcome of the last job (succeeded, needs_human, failed, cancelled).
+  job-id:
+    description: Id of the last job run.
+  branch:
+    description: The loopback/ branch of a fix.
+  pr-url:
+    description: The pull request of a fix, when one was opened.
+  uploaded:
+    description: Number of source maps uploaded (upload-sourcemaps).
+runs:
+  using: node24
+  main: dist/index.js
