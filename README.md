@@ -32,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: loopback-dev/action@v1
+      - uses: Loopback-so/action@v1
         with:
           agent-key: ${{ secrets.LOOPBACK_AGENT_KEY }}
 ```
@@ -145,7 +145,7 @@ before the Loopback step:
           fetch-depth: 0
           persist-credentials: false
       - run: sudo apt-get install -y bubblewrap
-      - uses: loopback-dev/action@v1
+      - uses: Loopback-so/action@v1
         with:
           agent-key: ${{ secrets.LOOPBACK_AGENT_KEY }}
 ```
@@ -211,7 +211,7 @@ Add a step after your production build. The job needs `id-token: write`:
 
 ```yaml
       - run: npm run build
-      - uses: loopback-dev/action@v1
+      - uses: Loopback-so/action@v1
         with:
           command: upload-sourcemaps
           sourcemaps-path: dist
