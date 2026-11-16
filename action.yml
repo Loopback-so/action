@@ -1,5 +1,5 @@
 name: Loopback
-description: Runs Loopback jobs in your GitHub runner (diagnosis, verified fix on a loopback/ branch) and uploads source maps.
+description: Runs Loopback jobs in your Linux GitHub runner (diagnosis, verified fix on a loopback/ branch) and uploads source maps.
 author: Loopback
 branding:
   icon: check-circle

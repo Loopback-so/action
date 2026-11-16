@@ -6,6 +6,19 @@ so that minified stack traces in tickets point to real files and lines.
 
 Code understanding and verification are powered by [vexp](https://vexp.dev).
 
+## Requirements
+
+Linux only for now. The action needs a Linux runner: `ubuntu-latest`, another `ubuntu-*` image,
+or a self-hosted Linux runner. On macOS and Windows runners your tests do not run: the sandbox that
+runs them, bubblewrap, exists only on Linux (see below).
+
+Every repository whose tests run on Linux is supported. Repositories whose tests need macOS
+(Xcode projects, native macOS and iOS apps on Apple's SDKs, iOS Simulator and UI tests) or Windows
+(.NET Framework 4.x, WPF and WinForms, MSVC C++, Windows-only APIs, PowerShell modules) are not
+supported yet: Loopback still handles support, triage, diagnosis and replies for them. In Managed
+and in your runner it proposes no fix with a pull request, and says why. In MCP mode your agent runs
+the tests on your own machine, whatever its system. Support for macOS and Windows is planned.
+
 ## Running jobs
 
 Loopback starts a job by sending a `repository_dispatch` event (`loopback-job`) whose
@@ -25,7 +38,7 @@ concurrency:
   group: loopback-${{ github.event.client_payload.job_id }}
 jobs:
   run:
-    runs-on: ubuntu-latest   # or [self-hosted]
+    runs-on: ubuntu-latest   # or [self-hosted, linux]
     timeout-minutes: 60      # above the job time limit of the workspace (at most 120 minutes)
     steps:
       - uses: actions/checkout@v7
@@ -126,8 +139,8 @@ tests "not run" and the reason.
 On a GitHub-hosted runner, a disposable VM, the action installs `bubblewrap` when it is missing and
 allows unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=0` on Ubuntu
 24.04) before the job. A self-hosted runner is never changed: install `bubblewrap` and allow user
-namespaces there yourself. bubblewrap runs on Linux only: on macOS and Windows runners the tests
-are reported as not run.
+namespaces there yourself. bubblewrap runs on Linux only: macOS and Windows runners are not
+supported yet, and the tests do not run there.
 
 Claude Code also runs the commands of the agent (your test command, read-only git commands)
 through `bubblewrap`, which removes the credentials from their environment. Without it, the agent
