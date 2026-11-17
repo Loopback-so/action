@@ -132356,6 +132356,13 @@ var JobPayloadSchema = external_exports.object({
   /** demo_case jobs: the fictional customer and the language of the email to write. */
   demo_case: DemoCaseRequestSchema.optional(),
   /**
+   * A job of the onboarding demo (`jobs.is_demo`, decision 91): its Managed sandbox reaches the
+   * install's standard hosts only, never the workspace's own (`usesWorkspaceEgressHosts`), so what
+   * the runner advises never sends the team to the Network settings. Not `ticket.is_demo`, which a
+   * widget test report's ticket has too while its fixes are the workspace's own. Absent = false.
+   */
+  demo_run: external_exports.boolean().optional(),
+  /**
    * Triage jobs that rewrite a reply draft ("Rewrite with instructions"): what the team that
    * reviewed the previous draft asks of the new one, scrubbed of personal data and secrets. The
    * agent follows it within its rules (`TEAM_GUIDANCE_RULE`) and never quotes it to the customer.
@@ -133003,8 +133010,10 @@ var WorkspaceSchema = external_exports.object({
    */
   managed_fixes_with_credits: external_exports.boolean().default(false),
   /**
-   * Hosts the workspace's Managed sandbox may reach in addition to the default allow-list (a
-   * private registry, a company mirror): `@loopback/shared/sandbox-egress` rules, at most 30.
+   * Hosts the Managed sandbox of the workspace's own fixes (`kind = 'fix'`, not `is_demo`:
+   * `usesWorkspaceEgressHosts`, decision 91) may reach in addition to the default allow-list (a
+   * company mirror, a download host the install uses): `@loopback/shared/sandbox-egress` rules, at
+   * most 30.
    */
   sandbox_egress_hosts: external_exports.array(external_exports.string()).default([]),
   /** Days without a customer reply before an answered ticket closes. */
@@ -137279,8 +137288,10 @@ var UpdateWorkspaceBodySchema = external_exports.strictObject({
    */
   managed_fixes_with_credits: external_exports.boolean().optional(),
   /**
-   * Hosts the Managed sandbox may reach in addition to its allow-list (a private
-   * registry, a company mirror): replaces the list. Audited with counts only.
+   * Hosts the Managed sandbox of the workspace's own fixes may reach in addition to its
+   * allow-list (a company mirror, a download host the install uses); never the demo's jobs or any
+   * other job (decision 91). A registry that needs credentials works only with the self-hosted
+   * runner. Replaces the list. Audited with counts only.
    */
   sandbox_egress_hosts: SandboxEgressHostsSchema.optional(),
   // Autonomy and review.
@@ -190873,15 +190884,16 @@ function mentionsRefusal(text, denials) {
   if (PROXY_REFUSED.some((rule) => rule.pattern.test(text))) return true;
   return NETWORK_FAILURE.test(text) && !LOCAL_ADDRESS.test(text);
 }
-function testsNetworkReason(denials) {
+function testsNetworkReason(denials, opts = {}) {
   const list6 = refusedHosts(denials).join(", ");
   const kinds = new Set(denials.map(kindOf));
   if (kinds.size === 1 && kinds.has("not_allowed")) {
-    return `The tests need network access to hosts the sandbox does not allow: ${list6}. They can be allowed in the workspace's execution settings.`;
+    return `The tests need network access to hosts the sandbox does not allow: ${list6}. ${opts.demo ? "The demo runs on the standard network, which does not include them." : "They can be allowed in the workspace's execution settings."}`;
   }
+  const notAllowed = opts.demo ? "The demo runs on the standard network, which does not include hosts outside its allow-list." : "Hosts that are not on the allow-list can be allowed in the workspace's execution settings.";
   return [
     `The tests need network access to hosts the sandbox refused: ${list6}.`,
-    kinds.has("not_allowed") ? "Hosts that are not on the allow-list can be allowed in the workspace's execution settings." : "",
+    kinds.has("not_allowed") ? notAllowed : "",
     kinds.has("unreachable") ? "Private addresses, and ports other than 443 (80 for plain HTTP), cannot be reached from the sandbox." : ""
   ].filter(Boolean).join(" ");
 }
@@ -191871,7 +191883,7 @@ async function runTestPlan(plan, env2, opts) {
     const denials = (await egressDenials(env2.parentEnv, since)).filter(blamableDenial).map((d6) => ({ ...d6, host: env2.secrets.mask(d6.host) }));
     if (denials.length > 0) {
       deniedHosts = refusedHosts(denials);
-      const hosts = testsNetworkReason(denials);
+      const hosts = testsNetworkReason(denials, { demo: env2.demo ?? false });
       const verdict = withSuitesFailed(
         servicesVerdict(list6, counts, (f8) => mentionsRefusal(`${f8.name}
 ${f8.headline}`, denials)),
@@ -193423,7 +193435,7 @@ var OTHER_OS_STEP = {
   macos: "These tests need a macOS machine, which the Managed sandbox and Linux runners are not. macOS runners, the GitHub Action on macOS included, are not supported yet, and the tests do not run there. Installing a toolchain will not change this. Tests that also run on Linux can run here, such as a Swift package whose Apple imports sit under `#if canImport`.",
   windows: "These tests need a Windows machine, which the Managed sandbox and Linux runners are not. Windows runners, the GitHub Action on Windows included, are not supported yet, and the tests do not run there. Installing a toolchain will not change this. Tests that target .NET instead of .NET Framework can run here."
 };
-function nextStep(failure4, managed, inImage) {
+function nextStep(failure4, managed, inImage, demo = false) {
   const d6 = failure4.diagnosis;
   const needsOs = failure4.toolchain?.needsOs ?? d6.needsOs;
   if (needsOs) return OTHER_OS_STEP[needsOs];
@@ -193433,6 +193445,9 @@ function nextStep(failure4, managed, inImage) {
       const hosts = d6.hosts.length ? d6.hosts.length > 5 ? `${d6.hosts.slice(0, 5).join(", ")} and ${d6.hosts.length - 5} more` : d6.hosts.join(", ") : "a host the install asked for";
       if (managed && d6.egress === "unreachable") {
         return `The sandbox cannot reach ${hosts}: it never connects to private addresses, nor to ports other than 443 (80 for plain HTTP), and no setting changes that. Fixes of this repository run with the self-hosted runner, inside the network that reaches them.`;
+      }
+      if (managed && demo) {
+        return `The sandbox's network refused ${hosts}. The demo runs on the standard network, which does not include these hosts; the workspace's own fixes reach them on its runner, or in the Managed sandbox once they are added in its Network settings.`;
       }
       return managed ? `The sandbox's network refused ${hosts}: allow these hosts in the workspace's execution settings (Network), then start the fix again.` : `A proxy refused ${hosts}: allow it where the runner runs, then start the fix again.`;
     }
@@ -193454,6 +193469,9 @@ function nextStep(failure4, managed, inImage) {
     case "registry_auth": {
       if (!managed) return `A registry asked for credentials the runner does not have: give it the registry's credentials (for example NPM_TOKEN), then start the fix again.`;
       const registry3 = names || "the registry's host";
+      if (d6.unconfirmed && demo) {
+        return `The sandbox's proxy or the registry answered 403. The demo runs on the standard network and holds no registry credentials, so it cannot install from ${registry3}. The workspace's own fixes in the Managed sandbox also reach the hosts added in its Network settings; a registry that wants credentials needs the self-hosted runner.`;
+      }
       return d6.unconfirmed ? `The sandbox's proxy or the registry answered 403. If ${registry3} is not allowed yet, allow it in the workspace's execution settings (Network), then start the fix again. If it is, the registry wants credentials, which the Managed sandbox never holds: fixes of this repository then run with the self-hosted runner, which can use them.` : "A private registry asked for credentials, which the Managed sandbox never holds: fixes of this repository run with the self-hosted runner, which can use them.";
     }
     case "build_scripts_skipped":
@@ -193468,7 +193486,7 @@ function nextStep(failure4, managed, inImage) {
       return "The output below shows why.";
   }
 }
-function refusal2(failure4, code, managed, opening) {
+function refusal2(failure4, code, managed, opening, demo = false) {
   const inImage = failure4.toolchain?.inImage ?? failure4.diagnosis.inImage;
   const d6 = failure4.diagnosis;
   return {
@@ -193477,7 +193495,7 @@ function refusal2(failure4, code, managed, opening) {
     retryable: d6.retryable,
     // A setup command that failed for a reason of its own is the team's command or build, not an install.
     reasonCode: failure4.setup && d6.cause === "unknown" ? "setup_command_failed" : setupReasonCode(d6.cause, managed, inImage, d6.egress, failure4.toolchain?.needsOs ?? d6.needsOs),
-    headline: `${opening} ${nextStep(failure4, managed, inImage)}`,
+    headline: `${opening} ${nextStep(failure4, managed, inImage, demo)}`,
     details: [
       `${code === "toolchain_missing" ? "Missing" : failure4.setup ? "Setup" : "Installation"}: ${failure4.text}`.slice(0, 1500),
       d6.refused.length ? `Refused by the sandbox: ${d6.refused.join(", ")}`.slice(0, 1500) : void 0,
@@ -193503,6 +193521,7 @@ function fixPreflight(input2) {
   const plan = input2.testPlan;
   if (!plan) return null;
   const managed = input2.managed ?? false;
+  const demo = input2.demo ?? false;
   if (input2.isolation) return isolationRefusal(plan, input2.isolation);
   if (input2.toolchain) {
     const where = managed ? "the Managed sandbox does not have" : "this runner does not have";
@@ -193510,11 +193529,11 @@ function fixPreflight(input2) {
     const cause = input2.toolchain.diagnosis.cause;
     const has3 = available.length && cause !== "toolchain_missing" ? ` (it has ${available.join(", ")})` : "";
     const opening = cause === "toolchain_missing" || cause === "toolchain_version" ? `The project tests (${plan.command}) need ${input2.toolchain.step}, which ${where}${has3}: no fix can pass the tests here, so the agent did not start.` : `The project tests (${plan.command}) need ${input2.toolchain.step}, which ${where}${has3}, and its download for this job failed: the agent did not start.`;
-    return refusal2(input2.toolchain, "toolchain_missing", managed, opening);
+    return refusal2(input2.toolchain, "toolchain_missing", managed, opening, demo);
   }
   if (input2.installFailure) {
     const opening = input2.installFailure.setup ? `The setup command of the project tests (${plan.command}) failed on the base commit (${input2.installFailure.text}), so no test could run on a fix: the agent did not start.` : `The dependencies of the project tests (${plan.command}) could not be installed (${input2.installFailure.text}), so no test could run on a fix: the agent did not start.`;
-    return refusal2(input2.installFailure, "install_failed", managed, opening);
+    return refusal2(input2.installFailure, "install_failed", managed, opening, demo);
   }
   if (input2.skippedBuild) {
     const note = skippedBuildNote(input2.skippedBuild);
@@ -193530,22 +193549,23 @@ function fixPreflight(input2) {
       text: note
     };
     const opening = `${note}. No fix can pass the project tests (${plan.command}) here, so the agent did not start.`;
-    return refusal2(failure4, "install_failed", managed, opening);
+    return refusal2(failure4, "install_failed", managed, opening, demo);
   }
   return null;
 }
 function environmentStop(plan, failure4, managed, opts = {}) {
+  const demo = opts.demo ?? false;
   if (opts.onBase) {
     const what = failure4.setup ? "The setup command" : "The install";
     const opening2 = `${what} fails after the agent even on the base commit's sources (${failure4.text}), although it passed before the agent: it is not the fix's change, and the project tests (${plan.command}) could not run on the fix, so no pull request was opened.`;
-    const stop = refusal2(failure4, "install_failed", managed, opening2);
+    const stop = refusal2(failure4, "install_failed", managed, opening2, demo);
     if (failure4.diagnosis.cause === "unknown" || failure4.diagnosis.cause === "registry_auth") {
       return { ...stop, reasonCode: failure4.setup ? "setup_command_failed" : "setup_install_failed", headline: `${opening2} ${AFTER_THE_AGENT} The output below shows why.` };
     }
     return stop;
   }
   const opening = failure4.setup ? `The setup command could not run on the fix (${failure4.text}), so the project tests (${plan.command}) could not run on it and no pull request was opened.` : `The dependencies the fix changed could not be installed (${failure4.text}), so the project tests (${plan.command}) could not run on it and no pull request was opened.`;
-  return refusal2(failure4, "install_failed", managed, opening);
+  return refusal2(failure4, "install_failed", managed, opening, demo);
 }
 var AFTER_THE_AGENT = "Once the agent has run, it runs as the fix's code does: the machine read-only except the checkout, the job's own directories and the repository's cache, a home directory of the job's own, and no registry credentials. Make it work that way (write only inside the checkout), then start the fix again.";
 
@@ -195796,7 +195816,7 @@ async function verifyAndPropose(ctx, salvaging) {
       } else {
         const stop = whose && !whose.own ? whose.stop : reinstall;
         const onBase = whose !== void 0 && !whose.own && whose.onBase;
-        environment = environmentStop(ctx.testPlan, stop, ctx.mode === "managed", { onBase });
+        environment = environmentStop(ctx.testPlan, stop, ctx.mode === "managed", { onBase, demo: ctx.testEnv.demo ?? false });
         const reason2 = onBase ? `${stop.setup ? "The tests of the fix could not be set up" : "The dependencies of the fix could not be installed"}: ${installFailureLine(stop)} (on the base commit's sources too)` : `${what}: ${line}`;
         testOutcome = {
           report: {
@@ -199225,6 +199245,9 @@ var LLM_GATEWAY_PATH = "/v1/llm/anthropic";
 var PAYLOAD_TIMEOUT_MS = 6e4;
 var LICENSE_WAIT_MS = 9e4;
 var LICENSE_PAUSE_MS = 1e4;
+function isDemoJob(payload2) {
+  return payload2.demo_run === true || payload2.kind === "demo_case";
+}
 function isLicenseUnavailable(error64) {
   return isApiError(error64) && (error64.status === 503 || error64.status === 429) && error64.details?.reason === "engine_license_unavailable";
 }
@@ -199801,6 +199824,7 @@ async function executeJob(options, jobId, credentials) {
     );
     const testDir = join58(jobDir, "tests");
     const runsTests = payload2.kind === "fix" || payload2.kind === "demo_case";
+    const demoRun = isDemoJob(payload2);
     const toolchains = loadToolchains(parentEnv);
     if (toolchains.manifestProblem) events.warn("tests.toolchains", `The toolchains are looked for on this machine: ${toolchains.manifestProblem}`);
     const requireSandbox = options.requireCommandSandbox ?? false;
@@ -199862,6 +199886,8 @@ async function executeJob(options, jobId, credentials) {
       cachePerRun,
       // The Managed sandbox reaches only the hosts of its egress proxy's allow-list.
       restrictedNetwork: mode === "managed" && Boolean(parentEnv.HTTPS_PROXY ?? parentEnv.https_proxy),
+      // The onboarding demo's: the standard network alone, never the workspace's hosts (decision 91).
+      ...demoRun ? { demo: true } : {},
       toolchains: toolchainSetup,
       secrets,
       sandbox
@@ -199888,6 +199914,7 @@ async function executeJob(options, jobId, credentials) {
           setup: configuredValue(testPlan?.setup)
         }
       );
+      const preflight = (input2) => fixPreflight({ ...input2, managed: mode === "managed", demo: demoRun });
       const refuseFix = (refusal3) => {
         if (!refusal3) return;
         if (signal.aborted) throw signal.reason;
@@ -199903,10 +199930,10 @@ async function executeJob(options, jobId, credentials) {
           details: { command: testPlan?.command ?? null, details: refusal3.details }
         });
       };
-      if (sandboxRefused && testPlan) refuseFix(fixPreflight({ testPlan, isolation: isolationFailureOf(sandbox), managed: mode === "managed" }));
+      if (sandboxRefused && testPlan) refuseFix(preflight({ testPlan, isolation: isolationFailureOf(sandbox) }));
       const problem = testPlan && !sandboxRefused ? toolchainProblem(testPlan, testEnv) : void 0;
       const toolchain = problem ? toolchainFailure(problem, { denials: provisionDenials, secrets, restrictedNetwork: testEnv.restrictedNetwork ?? false }) : void 0;
-      refuseFix(fixPreflight({ testPlan, toolchain, managed: mode === "managed" }));
+      refuseFix(preflight({ testPlan, toolchain }));
       if (testPlan) {
         heartbeat.phase("setup", "installing dependencies");
         installFailure = await installDependencies(testPlan, testEnv, {
@@ -199923,7 +199950,7 @@ async function executeJob(options, jobId, credentials) {
             ...installFailure.diagnosis.hosts.length ? { hosts: installFailure.diagnosis.hosts } : {}
           });
         }
-        refuseFix(fixPreflight({ testPlan, installFailure, managed: mode === "managed" }));
+        refuseFix(preflight({ testPlan, installFailure }));
       }
       baselineTypes = await runTypeCheck(repoPath, {
         nodeBinDir: node2.binDir,
@@ -199956,7 +199983,7 @@ async function executeJob(options, jobId, credentials) {
           }
         );
         if (baselineFailing) log(`Failing on the base commit: ${failingLine(baselineFailing)}`);
-        refuseFix(fixPreflight({ testPlan, skippedBuild: baselineTests.skippedBuild, managed: mode === "managed" }));
+        refuseFix(preflight({ testPlan, skippedBuild: baselineTests.skippedBuild }));
       }
       if (testPlan && !installFailure && !sandboxRefused || baselineTypes.ran) {
         heartbeat.phase("setup", "recording the files the repository ignores");
