@@ -133,8 +133,10 @@ Docker socket. So the harness runs your dependency installs, tests and TypeScrip
 inside `bubblewrap`: in their own PID namespace (no other process is visible, and nothing they
 start outlives them), with setuid programs disabled, with the Docker socket, `/tmp`, the job's
 temporary directory and the cloud credential files of earlier steps out of reach. Without a
-working bubblewrap they do not run at all: the job log says why, and the fix is reported with its
-tests "not run" and the reason.
+working bubblewrap they do not run at all, so a fix of a repository with tests cannot be proven:
+it is refused before the agent starts, with the reason (`setup_isolation_unavailable`), no pull
+request is opened and no fix credit is used. A repository without tests is still verified by the
+code engine.
 
 On a GitHub-hosted runner, a disposable VM, the action installs `bubblewrap` when it is missing and
 allows unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=0` on Ubuntu

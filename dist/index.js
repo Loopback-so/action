@@ -131606,6 +131606,12 @@ var HARNESS_REASON_CODES = [
   "setup_toolchain_version",
   /** The tests need macOS (Xcode, Apple's SDKs) or Windows (.NET Framework): no runner here can run them, in any mode. */
   "setup_platform_unsupported",
+  /**
+   * A runner where no sandbox can keep the repository's code (its tests) away from the job's
+   * credentials: a fix of a repository with tests cannot be proven there, so it is refused before
+   * the agent (rule 3, ARCHITETTURA decision 89).
+   */
+  "setup_isolation_unavailable",
   /** The repository's lockfile does not match its manifest. */
   "setup_lockfile",
   /** After the agent, the repository's setup or install command wrote outside what the fix's code may write. */
@@ -131662,6 +131668,11 @@ var PREFLIGHT_CAUSES = [
   "timeout",
   /** Timeouts, resets, 5xx or 429 from an allowed host, with no refusal of the proxy. */
   "transient_network",
+  /**
+   * The runner cannot isolate the repository's code from the job's credentials (no working
+   * bubblewrap): its tests never run there (ARCHITETTURA decision 89).
+   */
+  "isolation",
   /** Nothing above: the output says what. */
   "unknown"
 ];
@@ -132397,12 +132408,20 @@ var UsageReportSchema = external_exports.object({
 var ESCALATION_KINDS = ["engine_unavailable"];
 var PREFLIGHT_MAX_HOSTS = 20;
 var PreflightReportSchema = external_exports.object({
-  /** The harness's error code: the runner lacks a toolchain, or the install failed. */
-  code: external_exports.enum(["toolchain_missing", "install_failed"]),
+  /**
+   * The harness's error code: the runner lacks a toolchain, the install failed, or the runner
+   * cannot isolate the repository's code from the job's credentials (decision 89).
+   */
+  code: external_exports.enum(["toolchain_missing", "install_failed", "isolation_unavailable"]),
   cause: external_exports.enum(PREFLIGHT_CAUSES).catch("unknown"),
   retryable: external_exports.boolean(),
   /** `host:port` the sandbox's egress proxy refused during the step (the API stores the count). */
-  hosts: external_exports.array(external_exports.string().min(1).max(300)).max(PREFLIGHT_MAX_HOSTS).optional()
+  hosts: external_exports.array(external_exports.string().min(1).max(300)).max(PREFLIGHT_MAX_HOSTS).optional(),
+  /**
+   * A slug that says more about the cause (`isolation`: `bwrap_missing`, `userns_denied`…). A code,
+   * never text (rule 5); one this version cannot read is dropped, never the block.
+   */
+  detail: external_exports.string().regex(/^[a-z][a-z0-9_]{0,39}$/).optional().catch(void 0)
 });
 var JobResultSchema = external_exports.object({
   status: JobResultStatusSchema,
@@ -183849,7 +183868,8 @@ var NEEDS_HUMAN = /* @__PURE__ */ new Set([
   "security",
   "timeout",
   "toolchain_missing",
-  "install_failed"
+  "install_failed",
+  "isolation_unavailable"
 ]);
 var REASON_CODE = {
   invalid_job: "payload_unavailable",
@@ -183859,7 +183879,8 @@ var REASON_CODE = {
   timeout: "job_timed_out",
   // The refusal itself carries the code of its cause (`fixPreflight`); these are for one without it.
   toolchain_missing: "setup_toolchain_missing",
-  install_failed: "setup_install_failed"
+  install_failed: "setup_install_failed",
+  isolation_unavailable: "setup_isolation_unavailable"
 };
 var HarnessError = class extends Error {
   name = "HarnessError";
@@ -184509,10 +184530,11 @@ var CREDENTIAL_FILE_VARIABLES2 = [
   "AWS_SHARED_CREDENTIALS_FILE"
 ];
 var NOT_LINUX = "repository commands can be isolated only on Linux, with bubblewrap";
+var NAMESPACES_REFUSED = /namespace|uid map|gid map|setgroups|unshare/i;
 async function probeBubblewrap(parentEnv, opts = {}) {
-  if ((opts.platform ?? process.platform) !== "linux") return { reason: NOT_LINUX };
+  if ((opts.platform ?? process.platform) !== "linux") return { reason: NOT_LINUX, detail: "platform_unsupported" };
   const bwrap = findOnPath("bwrap", parentEnv);
-  if (!bwrap) return { reason: "bubblewrap (bwrap) is not installed" };
+  if (!bwrap) return { reason: "bubblewrap (bwrap) is not installed", detail: "bwrap_missing" };
   const r7 = await new Promise((resolve13) => {
     execFile2(
       bwrap,
@@ -184525,10 +184547,45 @@ async function probeBubblewrap(parentEnv, opts = {}) {
     );
   });
   if (r7.code === 0) return { bwrap };
-  if (r7.timedOut) return { reason: "bubblewrap did not answer in time" };
-  const detail2 = r7.stderr.trim().split("\n").at(-1)?.trim();
-  if (detail2) return { reason: `bubblewrap cannot create namespaces here (${detail2.slice(0, 200)})` };
-  return { reason: `bubblewrap did not isolate the processes (exit ${r7.code ?? "signal"})` };
+  if (r7.timedOut) return { reason: "bubblewrap did not answer in time", detail: "probe_timeout" };
+  const said = r7.stderr.trim().split("\n").at(-1)?.trim();
+  if (said) return { reason: `bubblewrap cannot create namespaces here (${said.slice(0, 200)})`, detail: NAMESPACES_REFUSED.test(r7.stderr) ? "userns_denied" : "bwrap_failed" };
+  return { reason: `bubblewrap did not isolate the processes (exit ${r7.code ?? "signal"})`, detail: "bwrap_failed" };
+}
+function isolationAction(detail2) {
+  switch (detail2) {
+    case "platform_unsupported":
+      return "Run the repository's commands on Linux: the GitHub Action on a Linux runner (ubuntu-latest) or a self-hosted runner on Linux.";
+    case "bwrap_missing":
+      return "Install bubblewrap where the runner runs.";
+    case "userns_denied":
+    case "bwrap_failed":
+      return "Allow unprivileged user namespaces where the runner runs: in a container, start it with the seccomp profile the runner's seccomp-profile command prints, or with gVisor or Kata.";
+    case "probe_timeout":
+      return "Check that bubblewrap starts promptly where the runner runs.";
+    case "probe_failed":
+      return "Install bubblewrap and allow unprivileged user namespaces where the runner runs.";
+  }
+}
+function isolationAdvice(detail2) {
+  switch (detail2) {
+    case "platform_unsupported":
+      return "Run fixes of this repository with the GitHub Action on a Linux runner (ubuntu-latest) or with a self-hosted runner on Linux.";
+    case "bwrap_missing":
+      return "Install bubblewrap where the runner runs, then start the fix again.";
+    case "userns_denied":
+    case "bwrap_failed":
+      return "Allow unprivileged user namespaces where the runner runs: in a container, start it with the seccomp profile the runner's seccomp-profile command prints, or with gVisor or Kata. Then start the fix again.";
+    case "probe_timeout":
+      return "Check that bubblewrap starts promptly where the runner runs, then start the fix again.";
+    case "probe_failed":
+      return "Install bubblewrap and allow unprivileged user namespaces where the runner runs, then start the fix again.";
+  }
+}
+function isolationFailureOf(sandbox) {
+  if (!sandbox || sandbox.bwrap || !sandbox.required) return void 0;
+  const detail2 = sandbox.detail ?? "probe_failed";
+  return { reason: sandbox.unavailable ?? "no sandbox", detail: detail2, advice: isolationAdvice(detail2) };
 }
 function realDir(path6) {
   if (!path6 || !isAbsolute14(path6)) return void 0;
@@ -184574,7 +184631,7 @@ function commandSandbox(input2) {
   ];
   const mask = [...new Set(files.map(realFile).filter((p3) => p3 !== void 0))];
   return {
-    ...input2.probe.bwrap ? { bwrap: input2.probe.bwrap } : { unavailable: input2.probe.reason ?? "bubblewrap is not available" },
+    ...input2.probe.bwrap ? { bwrap: input2.probe.bwrap } : { unavailable: input2.probe.reason ?? "bubblewrap is not available", detail: input2.probe.detail ?? "probe_failed" },
     required: input2.required,
     hide: hide2,
     keep,
@@ -184584,9 +184641,9 @@ function commandSandbox(input2) {
   };
 }
 function sandboxRefusal(sandbox) {
-  if (!sandbox || sandbox.bwrap || !sandbox.required) return void 0;
-  const way = sandbox.unavailable === NOT_LINUX ? "Run it on a Linux machine to run the tests." : "Install bubblewrap and allow unprivileged user namespaces to run it here.";
-  return `This runner cannot isolate the repository's code from the job's credentials (${sandbox.unavailable ?? "no sandbox"}). ${way}`;
+  const failure4 = isolationFailureOf(sandbox);
+  if (!failure4) return void 0;
+  return `This runner cannot isolate the repository's code from the job's credentials (${failure4.reason}). ${isolationAction(failure4.detail)}`;
 }
 function sandboxedArgv(sandbox, argv, cwd) {
   const existing = (paths) => paths.map((p3) => existsSync13(p3) ? realDir(p3) : void 0).filter((p3) => p3 !== void 0);
@@ -184782,7 +184839,7 @@ function teeTo(path6, maxBytes) {
 
 // ../runner/src/engine.ts
 var VEXP_CLI_PACKAGE = "vexp-cli";
-var VEXP_CLI_VERSION = "3.5.0";
+var VEXP_CLI_VERSION = "3.5.1";
 async function installEngine(prefix, input2) {
   const npm = join25(dirname12(process.execPath), "npm");
   if (!existsSync14(npm)) return void 0;
@@ -193348,6 +193405,8 @@ function setupReasonCode(cause, managed, inImage, egress, needsOs) {
       return "setup_timeout";
     case "transient_network":
       return "setup_network";
+    case "isolation":
+      return "setup_isolation_unavailable";
     case "unknown":
       return "setup_install_failed";
   }
@@ -193403,6 +193462,8 @@ function nextStep(failure4, managed, inImage) {
       return `It ran past its time limit of ${minutes(failure4.timeLimitMs)}. A slow registry can cause this: starting the fix again may work.`;
     case "transient_network":
       return `${d6.summary.charAt(0).toUpperCase()}${d6.summary.slice(1)}: the failure looks temporary, and starting the fix again in a few minutes may work.`;
+    case "isolation":
+      return "This runner cannot keep the repository's code away from the job's credentials: make the sandbox work where the runner runs, then start the fix again.";
     case "unknown":
       return "The output below shows why.";
   }
@@ -193426,10 +193487,23 @@ ${failure4.excerpt}`.slice(0, 3e3) : void 0
     hosts: d6.hosts
   };
 }
+function isolationRefusal(plan, f8) {
+  return {
+    code: "isolation_unavailable",
+    cause: "isolation",
+    retryable: false,
+    reasonCode: "setup_isolation_unavailable",
+    headline: `The project tests (${plan.command}) run code a fix can change, and this runner cannot keep that code away from the job's credentials (${f8.reason}): no fix can be proven here, so the agent did not start. ${f8.advice}`,
+    details: [`Isolation: ${f8.reason}`.slice(0, 1500), `Detail: ${f8.detail}`],
+    hosts: [],
+    detail: f8.detail
+  };
+}
 function fixPreflight(input2) {
   const plan = input2.testPlan;
   if (!plan) return null;
   const managed = input2.managed ?? false;
+  if (input2.isolation) return isolationRefusal(plan, input2.isolation);
   if (input2.toolchain) {
     const where = managed ? "the Managed sandbox does not have" : "this runner does not have";
     const available = input2.toolchain.toolchain?.available ?? [];
@@ -193521,7 +193595,11 @@ function testsGateFinding(input2) {
           after.report.reason ?? after.report.summary
         );
       case "sandbox":
-        return void 0;
+        return finding2(
+          `The project has a test suite (${command6}), but the sandbox could not run it on the fix: ${after.report.reason ?? after.report.summary}`,
+          "tests_not_run_on_fix",
+          after.report.reason ?? after.report.summary
+        );
       case "zero_tests":
         if (baseline2?.notRun === "zero_tests" || before === 0) return void 0;
         return finding2(
@@ -195343,7 +195421,13 @@ function preflightOutcome(refusal3, opts) {
 }
 function preflightReport(refusal3, secrets) {
   const hosts = [...new Set(refusal3.hosts.map((host) => secrets.mask(host)))].slice(0, PREFLIGHT_MAX_HOSTS);
-  return { code: refusal3.code, cause: refusal3.cause, retryable: refusal3.retryable, ...hosts.length ? { hosts } : {} };
+  return {
+    code: refusal3.code,
+    cause: refusal3.cause,
+    retryable: refusal3.retryable,
+    ...hosts.length ? { hosts } : {},
+    ...refusal3.detail ? { detail: refusal3.detail } : {}
+  };
 }
 function typeCheckState(ctx, after) {
   const before = ctx.baselineTypes;
@@ -199719,13 +199803,16 @@ async function executeJob(options, jobId, credentials) {
     const runsTests = payload2.kind === "fix" || payload2.kind === "demo_case";
     const toolchains = loadToolchains(parentEnv);
     if (toolchains.manifestProblem) events.warn("tests.toolchains", `The toolchains are looked for on this machine: ${toolchains.manifestProblem}`);
+    const requireSandbox = options.requireCommandSandbox ?? false;
+    const sandboxProbe = await (options.sandboxProbe ?? probeBubblewrap)(parentEnv);
+    const refusedBeforeAgent = requireSandbox && !sandboxProbe.bwrap && payload2.kind === "fix" && testPlan !== null;
     let node2 = chooseNode(repoPath, parentEnv, toolchains.fromManifest ? toolchains.get("node").map((n3) => ({ version: n3.version, binDir: n3.binDir })) : []);
     const toolchainSetup = selectToolchains(runsTests ? testPlan : null, { repoPath, privateDir: testDir, parentEnv, toolchains, node: node2 });
     const cachePerRun = mode === "managed" && options.cacheDir !== void 0 && !sameFileSystem(options.cacheDir, repoPath);
     const testCacheDir = options.cacheDir && mode !== "managed" ? repositoryCache(options.cacheDir, payload2.repository.full_name) : options.cacheDir;
     if (testCacheDir) await mkdir25(testCacheDir, { recursive: true });
     let provisionDenials = [];
-    if (toolchainSetup.downloads.length > 0) {
+    if (toolchainSetup.downloads.length > 0 && !refusedBeforeAgent) {
       heartbeat.phase("setup", "preparing the toolchains");
       const provisionSince = Date.now() - 1e3;
       node2 = await provisionToolchains(toolchainSetup, node2, {
@@ -199739,11 +199826,11 @@ async function executeJob(options, jobId, credentials) {
       });
       if (toolchainSetup.failures.length > 0) provisionDenials = await egressDenials(parentEnv, provisionSince);
     }
-    const toolchainsOfTests = runsTests ? toolchainsLine(toolchainSetup, testPlan, node2) : null;
+    const toolchainsOfTests = runsTests && !refusedBeforeAgent ? toolchainsLine(toolchainSetup, testPlan, node2) : null;
     if (toolchainsOfTests) log(toolchainsOfTests);
     const sandbox = commandSandbox({
-      probe: await (options.sandboxProbe ?? probeBubblewrap)(parentEnv),
-      required: options.requireCommandSandbox ?? false,
+      probe: sandboxProbe,
+      required: requireSandbox,
       parentEnv,
       workRoot: baseDir,
       keep: [repoPath, testDir, testCacheDir, dirname22(node2.binDir), ...toolchainSetup.path],
@@ -199756,8 +199843,9 @@ async function executeJob(options, jobId, credentials) {
     if (sandbox.bwrap) {
       log(`Repository commands run in a sandbox (bubblewrap: own PID namespace, ${sandbox.mask.length} file(s) masked)`);
     } else if (sandboxRefused) {
-      events.warn("tests.isolation", `The tests and the type-check do not run in this job. ${sandboxRefused}`, {
-        reason: sandbox.unavailable ?? null
+      events.warn("tests.isolation", `The tests and the type-check cannot run in this job: ${sandboxRefused}`, {
+        reason: sandbox.unavailable ?? null,
+        detail: sandbox.detail ?? null
       });
     } else {
       log(`Repository commands run without a sandbox: ${sandbox.unavailable ?? "not available"}`);
@@ -199808,12 +199896,14 @@ async function executeJob(options, jobId, credentials) {
           code: refusal3.code,
           cause: refusal3.cause,
           retryable: refusal3.retryable,
-          ...refusal3.hosts.length ? { hosts: refusal3.hosts } : {}
+          ...refusal3.hosts.length ? { hosts: refusal3.hosts } : {},
+          ...refusal3.detail ? { detail: refusal3.detail } : {}
         });
         throw new HarnessError(refusal3.code, refusal3.headline, {
           details: { command: testPlan?.command ?? null, details: refusal3.details }
         });
       };
+      if (sandboxRefused && testPlan) refuseFix(fixPreflight({ testPlan, isolation: isolationFailureOf(sandbox), managed: mode === "managed" }));
       const problem = testPlan && !sandboxRefused ? toolchainProblem(testPlan, testEnv) : void 0;
       const toolchain = problem ? toolchainFailure(problem, { denials: provisionDenials, secrets, restrictedNetwork: testEnv.restrictedNetwork ?? false }) : void 0;
       refuseFix(fixPreflight({ testPlan, toolchain, managed: mode === "managed" }));
@@ -201750,9 +201840,9 @@ async function commandIsolationNotice(env2, probe = probeBubblewrap) {
   const result = await probe(env2);
   if (result.bwrap) return null;
   return [
-    `This runner cannot isolate the repository's code from the runner's credentials (${result.reason ?? "bubblewrap is not available"}): installs, tests and the type-check do not run here, and fixes are reported with their tests "not run".`,
+    `This runner cannot isolate the repository's code from the runner's credentials (${result.reason ?? "bubblewrap is not available"}): installs, tests and the type-check do not run here, and fixes of repositories with tests are refused before the agent starts, with the reason.`,
     ...env2.VEXP_MODE === "sdk" ? ["With VEXP_MODE=sdk a fix is verified only by those checks, so this runner proposes no fix."] : [],
-    result.reason === NOT_LINUX ? "Run the runner on a Linux machine to run them." : "In a container, run it with the seccomp profile that `loopback-runner seccomp-profile` prints (Docker's default plus user namespaces), or with gVisor or Kata; on a machine, install bubblewrap and allow unprivileged user namespaces."
+    result.detail === "platform_unsupported" || result.reason === NOT_LINUX ? "Run the runner on a Linux machine to run them." : "In a container, run it with the seccomp profile that `loopback-runner seccomp-profile` prints (Docker's default plus user namespaces), or with gVisor or Kata; on a machine, install bubblewrap and allow unprivileged user namespaces."
   ].join(" ");
 }
 
