@@ -131976,9 +131976,16 @@ var VerifyReportSchema = external_exports.object({
   produced_by: external_exports.enum(["harness", "agent", "server"]).optional(),
   engine_version: external_exports.string().optional()
 });
+var RERUN_GROUNDS = ["base_commit", "known_flaky"];
 var TestRerunsSchema = external_exports.object({
   tests: external_exports.array(external_exports.string().max(300)).min(1).max(3),
-  runs: external_exports.number().int().positive().max(10)
+  runs: external_exports.number().int().positive().max(10),
+  /**
+   * Why each test was rerun, in the order of `tests` (`RERUN_GROUNDS`). Absent: every one failed the
+   * same way on this job's base commit run (decision 87, and runners before decision 95); one this
+   * version cannot read is dropped.
+   */
+  grounds: external_exports.array(external_exports.enum(RERUN_GROUNDS)).min(1).max(3).optional().catch(void 0)
 });
 var TestReportSchema = external_exports.object({
   command: external_exports.string().nullable(),
@@ -131993,9 +132000,10 @@ var TestReportSchema = external_exports.object({
   duration_s: external_exports.number().nonnegative().optional(),
   /**
    * The suite failed on the fix only in tests that had failed the same way on the base commit's run
-   * before the agent, in files the change does not touch, and their packages' tests passed on every
-   * one of `runs` runs on their own (decision 87, the harness's rerun backstop): `passed` is true,
-   * and the evidence of the fix is E2 at most. Absent otherwise.
+   * before the agent (decision 87) or that an earlier fix job of the repository saw fail on its base
+   * commit (decision 95; `reruns.grounds`), in files the change does not touch, and their packages'
+   * tests passed on every one of `runs` runs on their own (the harness's rerun backstop): `passed` is
+   * true, and the evidence of the fix is E2 at most. Absent otherwise.
    */
   reruns: TestRerunsSchema.optional()
 });
@@ -132033,8 +132041,8 @@ var REGRESSION_STATUSES = [
   "partial",
   /**
    * The suite ran in full on the fix and failed only in tests that had failed the same way on the
-   * base commit, whose packages' tests then passed on every run on their own (`regression.reruns`):
-   * E2 at most.
+   * base commit, or that decision 95 lets rerun (`regression.reruns.grounds`), whose packages' tests
+   * then passed on every run on their own (`regression.reruns`): E2 at most.
    */
   "rerun_passed",
   /** The suite did not run (none, or the code cannot run here). */
@@ -132246,6 +132254,42 @@ var PreviousAttemptSchema = external_exports.object({
   tests: TestReportSchema.nullable(),
   failure_reason: external_exports.string().nullable()
 });
+var KNOWN_FLAKY_WINDOW_DAYS = 30;
+var KNOWN_FLAKY_TESTS_MAX = 50;
+var KNOWN_FLAKY_NAME_CHARS = 300;
+var KNOWN_FLAKY_FAILURE_KINDS = ["assertion", "exception", "setup"];
+var KnownFlakyTestSchema = external_exports.object({
+  /**
+   * The test as the run named it, its package's task first (`vexp-cli:test › name`); with
+   * `logged_line`, the whole line the job log showed (`name (in suite › suite, path/of/file.ts)`).
+   */
+  test: external_exports.string().min(1).max(KNOWN_FLAKY_NAME_CHARS),
+  /** Its suites, outermost first; absent when the history does not have them. */
+  suites: external_exports.array(external_exports.string().max(KNOWN_FLAKY_NAME_CHARS)).max(10).optional(),
+  /** Its file, relative to the repository root; absent when the history does not have it. */
+  file: external_exports.string().max(KNOWN_FLAKY_NAME_CHARS).optional(),
+  /**
+   * How it failed (`KNOWN_FLAKY_FAILURE_KINDS`); absent when the history does not say (an older
+   * harness), and dropped when this version cannot read it: such an entry never lets a test rerun.
+   */
+  kind: external_exports.enum(KNOWN_FLAKY_FAILURE_KINDS).optional().catch(void 0),
+  /**
+   * The first line of its message without the job's own directories: the root of its checkout (a
+   * path of it as the repository names it, the root alone as `.`), then its tests' TMPDIR and HOME
+   * (written `$TMPDIR` and `~`); masked, with every number written `N`, as the harness compares two
+   * failures of one test; absent when the history does not say (an older harness).
+   */
+  message: external_exports.string().max(KNOWN_FLAKY_NAME_CHARS).optional(),
+  /**
+   * The history has only the line the log showed (an older harness): `test` is that line, matched
+   * whole. It never says how the test failed, so it never lets a test rerun.
+   */
+  logged_line: external_exports.literal(true).optional(),
+  /** The earlier fix job whose base commit run failed it. */
+  job_id: external_exports.string().min(1).max(100),
+  /** When that run was recorded. */
+  failed_at: IsoDate2
+});
 var PullRequestInfoSchema = external_exports.object({
   number: external_exports.number().int().positive(),
   head_sha: external_exports.string(),
@@ -132388,6 +132432,12 @@ var JobPayloadSchema = external_exports.object({
   branch: FixBranchSchema.optional(),
   attempt: external_exports.number().int().positive().optional(),
   previous_attempts: external_exports.array(PreviousAttemptSchema).optional(),
+  /**
+   * Fix jobs run by the harness (Managed, runner): the tests earlier fix jobs of the same repository
+   * saw fail on their base commit's run in the last `KNOWN_FLAKY_WINDOW_DAYS` days, most recent first
+   * (decision 95). Absent when there are none.
+   */
+  known_flaky_tests: external_exports.array(KnownFlakyTestSchema).max(KNOWN_FLAKY_TESTS_MAX).optional(),
   /** pr_analysis jobs: the external pull request to analyse (no fix, no secrets). */
   pull_request: PullRequestInfoSchema.optional(),
   /** Whether the organization lets vexp tool names appear in reports. */
@@ -197288,7 +197338,7 @@ function deriveEvidence(f8) {
     ...f8.tests.executed !== void 0 ? { executed: f8.tests.executed } : {},
     regressed: f8.regressed.slice(0, 20).map((name) => name.slice(0, 300)),
     ...f8.fixed ? { fixed: f8.fixed } : {},
-    ...rerun ? { reruns: { tests: rerun.tests.slice(0, 3).map((name) => name.slice(0, 300)), runs: rerun.runs } } : {},
+    ...rerun ? { reruns: { tests: rerun.tests.slice(0, 3).map((name) => name.slice(0, 300)), runs: rerun.runs, ...rerun.grounds && rerun.grounds.length === rerun.tests.length ? { grounds: rerun.grounds.slice(0, 3) } : {} } } : {},
     ...f8.baselineFailing ? { baseline_failing: { names: f8.baselineFailing.names.slice(0, 20).map((name) => name.slice(0, 200)), total: f8.baselineFailing.total, complete: f8.baselineFailing.complete } } : {},
     ...f8.tests.detail ? { detail: f8.tests.detail.slice(0, 1e3) } : {}
   };
@@ -198010,7 +198060,7 @@ ${diagnosis2.root_cause_md}` : "",
 }
 
 // ../runner/src/tests/rerun.ts
-import { existsSync as existsSync30 } from "node:fs";
+import { existsSync as existsSync30, realpathSync as realpathSync10 } from "node:fs";
 import { isAbsolute as isAbsolute19, join as join56, relative as relative14, sep as sep13 } from "node:path";
 
 // ../runner/src/tests/gate.ts
@@ -198225,13 +198275,18 @@ function repositoryFile(repoPath, failure4, exists4) {
   const path6 = posix8(isAbsolute19(failure4.file) ? relative14(repoPath, failure4.file) : failure4.file);
   return path6 && !path6.startsWith("../") && path6 !== ".." && !isAbsolute19(path6) && exists4(join56(repoPath, path6)) ? path6 : void 0;
 }
-function failureKind(failure4) {
-  const kind = classifyFailure(failure4);
+function kindSaid(kind) {
   return kind === "assertion" ? "an assertion" : kind === "exception" ? "an error its body raised" : "before its body ran";
 }
-function quotedMessage(failure4) {
-  const line = (failure4.headline.split("\n")[0] ?? "").trim();
+function failureKind(failure4) {
+  return kindSaid(classifyFailure(failure4));
+}
+function quoted(text) {
+  const line = text.trim();
   return JSON.stringify(line.length > 100 ? `${line.slice(0, 100)}\u2026` : line);
+}
+function quotedMessage(failure4) {
+  return quoted(failure4.headline.split("\n")[0] ?? "");
 }
 function packageOf(name) {
   const task = name.slice(0, Math.max(0, name.indexOf(" \u203A ")));
@@ -198248,6 +198303,73 @@ function packageArgv(plan, pkg) {
 var RUN_DEFINITION = /(?:^|\/)(?:package\.json|\.npmrc|pnpm-workspace\.yaml|turbo\.jsonc?|tsconfig[^/]*\.json|\.nvmrc|\.node-version|\.tool-versions|\.yarnrc|\.yarnrc\.yml)$|(?:^|\/)\.volta\//i;
 function changesHowTestsRun(changes) {
   return changes.find((c6) => RUN_DEFINITION.test(c6.path))?.path;
+}
+function namesOf(dir) {
+  let real3;
+  try {
+    real3 = realpathSync10(dir);
+  } catch {
+    real3 = void 0;
+  }
+  const names = /* @__PURE__ */ new Set();
+  for (const name of [dir, real3]) {
+    if (!name) continue;
+    names.add(name);
+    names.add(posix8(name));
+  }
+  return [...names].filter((name) => name.length > 1 && name !== sep13).sort((a6, b6) => b6.length - a6.length);
+}
+function privateRoots(privateDir) {
+  if (!privateDir) return [];
+  const roots = [...namesOf(join56(privateDir, "tmp")).map((root6) => ({ root: root6, as: "$TMPDIR" })), ...namesOf(join56(privateDir, "home")).map((root6) => ({ root: root6, as: "~" }))];
+  return roots.sort((a6, b6) => b6.root.length - a6.root.length);
+}
+var GOES_ON = /^(?:[\w~-]|\.[\w~.-])/;
+function writtenAs(text, root6, as) {
+  return text.split(root6).reduce((acc, part) => `${acc}${GOES_ON.test(part) ? root6 : as}${part}`);
+}
+function withoutJobDirs(text, repoPath, privateDir) {
+  let out = text;
+  for (const root6 of namesOf(repoPath)) {
+    for (const prefix of /* @__PURE__ */ new Set([`${root6}/`, `${root6}${sep13}`])) out = out.split(prefix).join("");
+    out = writtenAs(out, root6, ".");
+  }
+  for (const { root: root6, as } of privateRoots(privateDir)) out = writtenAs(out, root6, as);
+  return out;
+}
+function recordedFailure(failure4, repoPath, mask, privateDir) {
+  return { kind: classifyFailure(failure4), message: failureMessage({ headline: mask(withoutJobDirs(failure4.headline, repoPath, privateDir)) }).slice(0, KNOWN_FLAKY_NAME_CHARS) };
+}
+function relativeFile(repoPath, file2) {
+  if (!file2) return void 0;
+  const path6 = posix8(isAbsolute19(file2) ? relative14(repoPath, file2) : file2);
+  return path6 && !path6.startsWith("../") && path6 !== ".." && !isAbsolute19(path6) ? path6 : void 0;
+}
+function baselineFailingTests(outcome, repoPath, mask, privateDir) {
+  if (outcome.report.passed !== false || !outcome.failures) return void 0;
+  const tests = outcome.failures.failures.filter((f8) => !f8.wholeFile).slice(0, FAILING_NAMES_MAX);
+  if (tests.length === 0) return void 0;
+  return tests.map((f8) => {
+    const file2 = relativeFile(repoPath, f8.file);
+    return {
+      name: mask(f8.name).slice(0, KNOWN_FLAKY_NAME_CHARS),
+      suites: (f8.suites ?? []).slice(0, 10).map((suite) => mask(suite).slice(0, KNOWN_FLAKY_NAME_CHARS)),
+      ...file2 && file2.length <= KNOWN_FLAKY_NAME_CHARS ? { file: file2 } : {},
+      ...recordedFailure(f8, repoPath, mask, privateDir)
+    };
+  });
+}
+var DAY_MS = 24 * 60 * 60 * 1e3;
+function knownFlakyRecords(failure4, repoPath, known, mask, now) {
+  if (known.length === 0 || failure4.wholeFile) return [];
+  const since = now - KNOWN_FLAKY_WINDOW_DAYS * DAY_MS;
+  const name = mask(failure4.name).slice(0, KNOWN_FLAKY_NAME_CHARS);
+  const suites = (failure4.suites ?? []).map((suite) => mask(suite).slice(0, KNOWN_FLAKY_NAME_CHARS)).join("\0");
+  const file2 = relativeFile(repoPath, failure4.file);
+  const line = mask(failureLine(failure4, repoPath)).slice(0, FAILING_NAME_CHARS);
+  return known.filter(
+    (k6) => Date.parse(k6.failed_at) >= since && (k6.logged_line ? k6.test === line : k6.test === name && (k6.suites === void 0 || k6.suites.join("\0") === suites) && (k6.file === void 0 || k6.file === file2))
+  );
 }
 var TURBO_COMMANDS = /* @__PURE__ */ new Set(["bin", "boundaries", "clone", "completion", "config", "daemon", "devtools", "docs", "g", "gen", "generate", "get-mfe-port", "help", "info", "link", "login", "logout", "ls", "prune", "query", "run", "scan", "telemetry", "unlink", "watch"]);
 var TASK_WORD = /^[\w@][\w@./:#-]*$/;
@@ -198311,6 +198433,33 @@ function turboGraph(stdout, plan) {
   if (missing2) return { reason: `turbo's graph for the root's test script has no test task of ${JSON.stringify(missing2.pkg.slice(0, 200))}` };
   return { builds };
 }
+function notTheSameWay(baseline2, failure4) {
+  const name = failure4.name;
+  if (baseline2.report.passed === true) return `${name} passed on the base commit's run: it may be the fix's`;
+  const before = (baseline2.failures?.failures ?? []).filter((f8) => sameTest(f8, failure4));
+  const first = before[0];
+  if (!first) return `${name} did not fail on the base commit's run (by its task, file, suites and name): it may be the fix's`;
+  const sameClass = before.find((f8) => classifyFailure(f8) === classifyFailure(failure4));
+  if (!sameClass) return `${name} failed another way on the base commit's run (${failureKind(first)}; on the fix, ${failureKind(failure4)}): it may be the fix's`;
+  return `${name} failed with another message on the base commit's run (${quotedMessage(sameClass)}; on the fix, ${quotedMessage(failure4)}): it may be the fix's`;
+}
+function knownFlakyGround(input2, failure4) {
+  const name = failure4.name;
+  const mask = input2.mask ?? ((text) => text);
+  const records = knownFlakyRecords(failure4, input2.repoPath, input2.knownFlaky ?? [], mask, input2.now ?? Date.now());
+  const { kind, message: message2 } = recordedFailure(failure4, input2.repoPath, mask, input2.privateDir);
+  const of = (k6) => `job ${k6.job_id} on ${k6.failed_at.slice(0, 10)}`;
+  const same = records.find((k6) => k6.kind === kind && k6.message === message2);
+  if (same) return { test: name, ground: "known_flaky", why: `${name} failed the same way on the base commit's run of ${of(same)}` };
+  const said = records.filter((k6) => k6.kind !== void 0 && k6.message !== void 0);
+  const sameClass = said.find((k6) => k6.kind === kind);
+  if (sameClass) return { refusal: `it failed with another message on the base commit's run of ${of(sameClass)} (${quoted(sameClass.message ?? "")}; on the fix, ${quoted(message2)})` };
+  const other = said[0];
+  if (other?.kind) return { refusal: `it failed another way on the base commit's run of ${of(other)} (${kindSaid(other.kind)}; on the fix, ${kindSaid(kind)})` };
+  const unsaid = records[0];
+  if (unsaid) return { refusal: `the base commit's run of ${of(unsaid)} failed it, but its record does not say how, so it is not known to have failed the same way` };
+  return { refusal: `no fix job of this repository saw it fail on its base commit's run in the last ${KNOWN_FLAKY_WINDOW_DAYS} days` };
+}
 function rerunEligibility(input2) {
   const { plan, after, baseline: baseline2, repoPath } = input2;
   const tracked = input2.tracked ?? (() => true);
@@ -198333,18 +198482,15 @@ function rerunEligibility(input2) {
   if (!baseline2?.report.ran) return no("the base commit's tests did not run before the agent");
   const changed2 = new Set(input2.changes.map((c6) => c6.path));
   const byPackage = /* @__PURE__ */ new Map();
+  const grounds = /* @__PURE__ */ new Map();
   for (const failure4 of list6.failures) {
     const name = failure4.name;
     if (failure4.wholeFile) return no(`${name}: the whole file failed (a file that did not load or whose process exited), not one test of it`);
     if (!failedTheSameWayOnBase(baseline2, failure4)) {
-      if (baseline2.report.passed === true) return no(`${name} passed on the base commit's run: it may be the fix's`);
-      const before = (baseline2.failures?.failures ?? []).filter((f8) => sameTest(f8, failure4));
-      const first = before[0];
-      if (!first) return no(`${name} did not fail on the base commit's run (by its task, file, suites and name): it may be the fix's`);
-      const sameClass = before.find((f8) => classifyFailure(f8) === classifyFailure(failure4));
-      if (!sameClass) return no(`${name} failed another way on the base commit's run (${failureKind(first)}; on the fix, ${failureKind(failure4)}): it may be the fix's`);
-      return no(`${name} failed with another message on the base commit's run (${quotedMessage(sameClass)}; on the fix, ${quotedMessage(failure4)}): it may be the fix's`);
-    }
+      const ground = knownFlakyGround(input2, failure4);
+      if ("refusal" in ground) return no(`${notTheSameWay(baseline2, failure4)} (${ground.refusal})`);
+      grounds.set(failure4, ground);
+    } else grounds.set(failure4, { test: name, ground: "base_commit", why: `${name} also failed, the same way, on the base commit before the agent` });
     const file2 = repositoryFile(repoPath, failure4, exists4);
     if (!file2) return no(`${name}: the run does not say which file of the repository it is in`);
     if (!tracked(file2)) return no(`${name}: ${file2} is not a file of the base commit but build output, whose source cannot be told`);
@@ -198357,16 +198503,24 @@ function rerunEligibility(input2) {
   const tasks = scriptTasks(input2.rootManifest);
   if (tasks.length === 0) return no("the root's test script on the base commit is not `turbo run <tasks>` alone (no option, no other command), so turbo's dry run of its tasks may not be the graph it runs");
   const pm = plan.packageManager ?? "npm";
+  const targets = [...byPackage].map(([pkg, tests]) => ({ pkg, argv: packageArgv(plan, pkg), tests }));
+  const said = targets.flatMap((t2) => t2.tests.map((test) => grounds.get(test))).filter((g6) => g6 !== void 0);
   return {
     eligible: true,
-    targets: [...byPackage].map(([pkg, tests]) => ({ pkg, argv: packageArgv(plan, pkg), tests })),
+    targets,
+    // Said only when decision 95 lets a test be rerun: decision 87's own case reads as it did.
+    ...said.some((g6) => g6.ground !== "base_commit") ? { grounds: said } : {},
     tasks,
     graph: turboThrough(pm, ["run", ...tasks, "--dry=json"]),
     rebuild: turboThrough(pm, ["run", "build"])
   };
 }
 function rerunReport(result, mask = (t2) => t2) {
-  return { tests: result.tests.map((name) => mask(name).slice(0, RERUN_NAME_CHARS)), runs: result.runs };
+  const grounds = result.grounds && result.grounds.length === result.tests.length ? result.grounds.map((g6) => g6.ground) : void 0;
+  return { tests: result.tests.map((name) => mask(name).slice(0, RERUN_NAME_CHARS)), runs: result.runs, ...grounds ? { grounds } : {} };
+}
+function groundsSaid(grounds, mask = (t2) => t2) {
+  return [...new Set(grounds.map((g6) => mask(g6.why)))].join("; ");
 }
 function passedIn(outcome, test) {
   const mine = (outcome.results ?? []).filter((r7) => r7.name === test.name && (r7.suites ?? []).join("\0") === (test.suites ?? []).join("\0") && (r7.file === void 0 || r7.file === test.file));
@@ -198378,7 +198532,9 @@ async function runReruns(plan, io, opts) {
   const mask = opts.mask ?? ((text) => text);
   const deadline = io.now() + opts.budgetMs;
   const left = () => deadline - io.now();
-  const no = (reason2) => ({ passed: false, reason: mask(reason2).slice(0, 600) });
+  const because = plan.grounds ? ` (rerun because ${groundsSaid(plan.grounds, mask).slice(0, 280)})` : "";
+  const cut = (reason2) => `${mask(reason2).slice(0, 600 - because.length)}${because}`;
+  const no = (reason2) => ({ passed: false, reason: cut(reason2) });
   const changedBy = async (step) => {
     const changed3 = await io.treeChange();
     return changed3 ? no(`${step} left the working copy other than the fix's: ${changed3}`) : void 0;
@@ -198386,7 +198542,7 @@ async function runReruns(plan, io, opts) {
   const readGraph = async () => {
     const printed = await io.graph(plan.graph, Math.min(GRAPH_MAX_MS, left()));
     const graph2 = "reason" in printed ? { reason: `turbo's dry run (${plan.graph.join(" ")}) did not succeed: ${printed.reason}` } : turboGraph(printed.stdout, plan);
-    return "reason" in graph2 ? { passed: false, reason: mask(graph2.reason).slice(0, 600), ineligible: true } : graph2;
+    return "reason" in graph2 ? { passed: false, reason: cut(graph2.reason), ineligible: true } : graph2;
   };
   if (left() < minRun) return no("no time was left for it");
   const prepared = await io.prepare(left());
@@ -198430,11 +198586,13 @@ async function runReruns(plan, io, opts) {
       if (missing2) return no(`${missing2.name} was not reported as passed on ${of} of ${tests} on their own (skipped, or not run)`);
     }
   }
-  return { passed: true, tests: plan.targets.flatMap((t2) => t2.tests.map((test) => test.name)), runs };
+  return { passed: true, tests: plan.targets.flatMap((t2) => t2.tests.map((test) => test.name)), runs, ...plan.grounds ? { grounds: plan.grounds } : {} };
 }
 function rerunLine(result, mask = (t2) => t2) {
   const one = result.tests.length === 1;
-  return `The failing test${one ? "" : "s"} also failed, the same way, on the base commit before the agent, and ${one ? "its package's" : "their packages'"} tests passed when run on their own, ${result.runs} of ${result.runs}: ${result.tests.map(mask).join("; ")}`;
+  const passed = `${one ? "its package's" : "their packages'"} tests passed when run on their own, ${result.runs} of ${result.runs}: ${result.tests.map(mask).join("; ")}`;
+  if (result.grounds?.some((g6) => g6.ground !== "base_commit")) return `The failing test${one ? " was" : "s were"} rerun because ${groundsSaid(result.grounds, mask)}, and ${passed}`;
+  return `The failing test${one ? "" : "s"} also failed, the same way, on the base commit before the agent, and ${passed}`;
 }
 function confirmTargets(plan, candidates) {
   const targets = [];
@@ -199427,7 +199585,7 @@ function privateResetLine(reset, what) {
 
 // ../runner/src/fresh/store.ts
 import { randomBytes as randomBytes3 } from "node:crypto";
-import { constants as constants14, realpathSync as realpathSync10 } from "node:fs";
+import { constants as constants14, realpathSync as realpathSync11 } from "node:fs";
 import { copyFile as copyFile8, lstat as lstat17, mkdir as mkdir30, rename as fsRename, rm as rm26, symlink as symlink9, writeFile as writeFile15 } from "node:fs/promises";
 import { dirname as dirname22, join as join61 } from "node:path";
 
@@ -199914,7 +200072,7 @@ async function installFreshStore(opts) {
   }
   if (aside) await rm26(aside, { recursive: true, force: true });
   timings.install = Math.round(performance.now() - at);
-  const fresh = git2.withGitDir(realpathSync10(dotGit));
+  const fresh = git2.withGitDir(realpathSync11(dotGit));
   const normalized = performance.now();
   await normalizeWorktree(fresh, opts.branch, records.base, await fresh.overrides(opts.signal));
   timings.normalize = Math.round(performance.now() - normalized);
@@ -201463,7 +201621,24 @@ async function verifyAndPropose(ctx, salvaging) {
       }
       const manifest = await git2.run(["cat-file", "-p", `${base}:package.json`], { overrides, signal: ctx.signal });
       const rootManifest = manifest.exitCode === 0 ? manifest.stdout : void 0;
-      const eligibility = rerunEligibility({ plan, repoPath, baseline: ctx.baselineTests, after: testOutcome, changes, rootManifest, tracked: (file2) => tracked.has(file2), exists: isThere, notCarried: notCarried(ctx, fixFiles) });
+      const eligibility = rerunEligibility({
+        plan,
+        repoPath,
+        // Decision 95: a message is compared with the history without this job's TMPDIR and HOME.
+        privateDir: ctx.testEnv.privateDir,
+        baseline: ctx.baselineTests,
+        after: testOutcome,
+        changes,
+        rootManifest,
+        tracked: (file2) => tracked.has(file2),
+        exists: isThere,
+        notCarried: notCarried(ctx, fixFiles),
+        // Decision 95: the tests earlier fix jobs of the repository saw fail on their base commit's
+        // run (the control plane's), read within the window by the harness's own wall clock.
+        knownFlaky: ctx.payload.known_flaky_tests ?? [],
+        now: Date.now(),
+        mask
+      });
       eligible = eligibility.eligible;
       decided = eligibility.eligible ? await runReruns(
         eligibility,
@@ -201478,7 +201653,7 @@ async function verifyAndPropose(ctx, salvaging) {
     if (ctx.signal.aborted) throw ctx.signal.reason;
     if (decided.passed) {
       reruns = rerunReport(decided, mask);
-      const line = rerunLine(reruns);
+      const line = rerunLine({ tests: reruns.tests, runs: reruns.runs, ...decided.grounds ? { grounds: decided.grounds } : {} }, mask);
       tests = { ...tests, passed: true, summary: [tests.summary.split("\n")[0] ?? "", line].join("\n").slice(0, 8e3), reruns };
       verify = withFindings(verify, [
         {
@@ -201489,7 +201664,7 @@ async function verifyAndPropose(ctx, salvaging) {
           detail: `${reruns.tests.join("; ")} (${reruns.runs} of ${reruns.runs} runs of ${reruns.tests.length === 1 ? "its package's" : "their packages'"} tests on their own)`.slice(0, 2e3)
         }
       ]);
-      ctx.events.warn("tests.rerun", line.slice(0, 500), { passed: true, tests: reruns.tests, runs: reruns.runs });
+      ctx.events.warn("tests.rerun", line.slice(0, 500), { passed: true, tests: reruns.tests, runs: reruns.runs, ...decided.grounds ? { grounds: decided.grounds.map((g6) => mask(g6.why).slice(0, 300)) } : {} });
     } else {
       notRerun = decided.reason;
       ctx.events.info("tests.rerun", `The failing tests were not accepted on a rerun of their packages' tests on their own: ${decided.reason}`.slice(0, 500), { passed: false, eligible, reason: decided.reason.slice(0, 500) });
@@ -202283,9 +202458,11 @@ function shownName(name) {
 function planExcerpts(reads, limits = ATTACHMENT_LIMITS) {
   const plan = /* @__PURE__ */ new Map();
   let total = limits.totalExcerptChars;
+  let left = reads.filter((read) => read.status === "read").length;
   for (const read of reads) {
     if (read.status !== "read") continue;
-    let own2 = Math.min(limits.excerptChars, total);
+    let own2 = Math.min(total, Math.max(limits.excerptChars, Math.floor(total / left)));
+    left -= 1;
     const excerpts = [];
     for (const text of read.texts) {
       const header = text.entry ? shownName(text.entry.name).length + HEADER_CHARS : 0;
@@ -206247,6 +206424,7 @@ async function executeJob(options, jobId, credentials) {
         });
         const outcome = baselineTests.report.ran ? baselineTests.report.passed ? "passed" : "failed" : "not run";
         const baselineFailing = failingOnRun(baselineTests, (text) => secrets.mask(text), testPlan.workspace?.tool === "turbo" ? { repoPath } : void 0);
+        const failingTests = testPlan.workspace?.tool === "turbo" ? baselineFailingTests(baselineTests, repoPath, (text) => secrets.mask(text), testEnv.privateDir) : void 0;
         events.info(
           "tests.baseline",
           `Base commit: ${outcome}: ${baselineTests.report.summary.split("\n")[0]?.slice(0, 300) ?? ""}`,
@@ -206259,7 +206437,8 @@ async function executeJob(options, jobId, credentials) {
               failing: baselineFailing.names,
               failing_total: baselineFailing.total,
               failing_complete: baselineFailing.complete
-            } : {}
+            } : {},
+            ...failingTests ? { failing_tests: failingTests } : {}
           }
         );
         if (baselineFailing) log2(`Failing on the base commit: ${failingLine(baselineFailing)}`);
