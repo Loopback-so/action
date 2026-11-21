@@ -135740,6 +135740,7 @@ var RepositoryViewSchema = RepositorySchema.extend({
    * Decision 117: per language, what the fix job runs before its install (`none`: nothing, and the
    * repository's CI is not read for it); `default: none` for the languages not named. Empty: the
    * file's `before_install:`, else the steps of the repository's CI. Older servers send none.
+   * Decision 120: `search: off` when the team turned the agent's search of the repository's files off.
    */
   before_install_commands: BeforeInstallCommandsSchema.default({})
 });
@@ -135865,9 +135866,10 @@ var UpdateRepositorySettingsBodySchema = external_exports.strictObject({
   setup_command: RepositoryCommandSchema.nullable().optional(),
   /**
    * Decision 117: per language, the step before its install: given keys are set, `null` clears
-   * one, keys left out are kept; `default` takes `none` or `null`.
+   * one, keys left out are kept; `default` takes `none` or `null`. Decision 120: `search` takes
+   * `off` (the agent's search of the repository's files is off), or `auto` or `null` (removed).
    */
-  before_install_commands: external_exports.partialRecord(external_exports.enum(BEFORE_INSTALL_KEYS), RepositoryCommandSchema.nullable()).refine((map5) => map5.default === void 0 || map5.default === null || map5.default === "none", { message: "default is none, or null", path: ["default"] }).optional(),
+  before_install_commands: external_exports.partialRecord(external_exports.enum(BEFORE_INSTALL_SETTING_KEYS), RepositoryCommandSchema.nullable()).refine((map5) => map5.default === void 0 || map5.default === null || map5.default === "none", { message: "default is none, or null", path: ["default"] }).refine((map5) => map5.search === void 0 || map5.search === null || map5.search === "off" || map5.search === "auto", { message: "search is off, auto or null", path: ["search"] }).optional(),
   release_strategy: ReleaseStrategySchema.optional(),
   tag_prefix: TagPrefixSchema.nullable().optional(),
   release_packages: ReleasePackagesSchema.nullable().optional(),
@@ -211552,6 +211554,13 @@ function suiteEnvironment(env2, suite) {
   if (!suite.root || suite.configured === "command") return env2;
   return { ...env2, repoPath: join66(env2.repoPath, suite.root) };
 }
+function emptyRunsAside(outcomes) {
+  const isEmpty = (o3) => o3.notRun === "zero_tests" && o3.exitCode === 0 && (o3.counts?.failed ?? 0) === 0;
+  const empty2 = outcomes.filter(isEmpty);
+  const ranTests = outcomes.some((o3) => !isEmpty(o3) && o3.report.ran && (o3.counts === void 0 || o3.counts.total > 0));
+  if (empty2.length === 0 || !ranTests) return { kept: [...outcomes], empty: [] };
+  return { kept: outcomes.filter((o3) => !isEmpty(o3)), empty: empty2 };
+}
 async function runSuite(suite, env2, opts) {
   const started = performance.now();
   const outcomes = [];
@@ -211572,8 +211581,11 @@ async function runSuite(suite, env2, opts) {
   if (outcomes.length === 0) {
     return { report: { command: suiteCommand(suite), passed: null, ran: false, summary: "No time was left to run these tests.", reason: "No time was left to run these tests.", reason_code: "no_time_left" }, timedOut: true, output: "", exitCode: null };
   }
-  const merged = mergeOutcomes(outcomes);
-  const report = cut && merged.report.ran ? { ...merged.report, passed: false, summary: `${merged.report.summary} (${suite.runs.length - outcomes.length} of its ${suite.runs.length} runs did not fit the time left)`.slice(0, 8e3) } : merged.report;
+  const { kept, empty: empty2 } = emptyRunsAside(outcomes);
+  const merged = mergeOutcomes(kept);
+  const emptyNote = empty2.length ? ` (no test to run in: ${empty2.map((o3) => o3.report.command ?? "a run").join("; ")})` : "";
+  const withEmpty = emptyNote ? { ...merged.report, summary: `${merged.report.summary}${emptyNote}`.slice(0, 8e3) } : merged.report;
+  const report = cut && withEmpty.ran ? { ...withEmpty, passed: false, summary: `${withEmpty.summary} (${suite.runs.length - outcomes.length} of its ${suite.runs.length} runs did not fit the time left)`.slice(0, 8e3) } : withEmpty;
   return {
     ...merged,
     report: { ...report, command: suiteCommand(suite) },
