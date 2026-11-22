@@ -137831,6 +137831,11 @@ var JOB_STEP_KEYS = [
   "sandbox_finished",
   "sandbox_stopped",
   "sandbox_requeued",
+  // Decision 121: a Managed run that waits for room, finds none in time, or runs out of memory.
+  "sandbox_waiting",
+  "sandbox_no_room",
+  "sandbox_out_of_memory",
+  "sandbox_out_of_memory_restart",
   "outcome_verified",
   "outcome_needs_human",
   "outcome_verify_failed",
@@ -139528,6 +139533,19 @@ function sandboxEgressHostsSchema(rule = sandboxEgressHostIssue) {
 var SandboxEgressHostsSchema = sandboxEgressHostsSchema();
 
 // ../shared/src/api/workspaces.ts
+var JobTimeLimitSchema = external_exports.object({
+  /** The workspace's own value; null = the install's default. */
+  minutes: external_exports.number().int().min(1).max(120).nullable(),
+  /** SANDBOX_MAX_MINUTES within 1..120 (core jobs/limits.ts jobMaxMinutes). */
+  default_minutes: external_exports.number().int().min(1).max(120),
+  /** MAX_JOB_MINUTES. */
+  max_minutes: external_exports.number().int().min(1)
+});
+var JOB_TIME_LIMIT_DEFAULT = {
+  minutes: null,
+  default_minutes: 20,
+  max_minutes: 120
+};
 var WorkspaceDetailSchema = WorkspaceSchema.extend({
   /** `<slug>@<inbound domain>` (null once the mailbox channel is removed). */
   inbound_address: external_exports.string().nullable(),
@@ -139543,7 +139561,9 @@ var WorkspaceDetailSchema = WorkspaceSchema.extend({
    * When a manager answered the Overview notice "Switch to Approve" by keeping Copilot (or chose
    * Copilot explicitly afterwards): the notice is not shown again for this workspace. Null: never.
    */
-  autonomy_notice_dismissed_at: IsoDateTimeSchema.nullable().default(null)
+  autonomy_notice_dismissed_at: IsoDateTimeSchema.nullable().default(null),
+  /** Decision 121: the job time limit the settings show. */
+  job_time_limit: JobTimeLimitSchema.default(() => ({ ...JOB_TIME_LIMIT_DEFAULT }))
 });
 var Name = external_exports.string().trim().min(1).max(120);
 var OptionalText = (max) => external_exports.string().trim().min(1).max(max).nullable();
@@ -139563,8 +139583,11 @@ var WorkspaceAgentConfigInputSchema = external_exports.strictObject({
   /** Credential the agent uses (API key, cloud provider, Codex auth.json) of this organization. */
   credential_id: idSchema("cred").nullable().optional(),
   effort: external_exports.string().trim().min(1).max(40).nullable().optional(),
-  /** Time limit of each job, in minutes (at most 120). */
-  max_minutes: external_exports.number().int().min(1).max(120).optional(),
+  /**
+   * Time limit of each job, in minutes (at most 120); null returns to the default
+   * (SANDBOX_MAX_MINUTES).
+   */
+  max_minutes: external_exports.number().int().min(1).max(120).nullable().optional(),
   /** Spending limit of each job, in USD. */
   max_cost_usd: external_exports.number().positive().max(1e3).optional(),
   /**
@@ -198760,8 +198783,8 @@ function cmakePlan(repoPath) {
   if (!existsSync25(join48(repoPath, "CMakeLists.txt"))) return void 0;
   const lists = findFiles(repoPath, (name) => name === "CMakeLists.txt", { maxDepth: 3, limit: 100 });
   if (!fileMentions(repoPath, lists, CTEST_MARKER)) return void 0;
-  const script = 'cmake --build "$0" --parallel && ctest --test-dir "$0" --output-on-failure --output-junit "$1"';
-  return { command: "ctest", argv: ["/bin/sh", "-c", script, "{build}", "{report}"], runner: "ctest", ecosystem: "cpp", source: "detected", reportFormat: "junit" };
+  const script = 'cmake --build "$0" --parallel "$2" && ctest --test-dir "$0" --output-on-failure --output-junit "$1"';
+  return { command: "ctest", argv: ["/bin/sh", "-c", script, "{build}", "{report}", "{jobs}"], runner: "ctest", ecosystem: "cpp", source: "detected", reportFormat: "junit" };
 }
 function elixirPlan(repoPath) {
   if (!existsSync25(join48(repoPath, "mix.exs")) || !hasMixTests(repoPath)) return void 0;
@@ -202959,7 +202982,7 @@ function cmakeSteps(env2, setup) {
   const generator = setup.toolchains.buildTools().includes("ninja") || findOnPath("ninja", env2.parentEnv) ? ["-G", "Ninja"] : [];
   return [
     { argv: ["cmake", "-S", ".", "-B", build2, ...generator, "-DCMAKE_BUILD_TYPE=Debug", "-DBUILD_TESTING=ON"], description: "cmake configure" },
-    { argv: ["cmake", "--build", build2, "--parallel"], description: "cmake --build", optional: true }
+    { argv: ["cmake", "--build", build2, "--parallel", String(jobCpus())], description: "cmake --build", optional: true }
   ];
 }
 function detectedSteps(plan, env2, again) {
@@ -205411,9 +205434,9 @@ function verificationRefusal(input2) {
   };
 }
 function testsTimeStep(language, demo = false) {
-  if (demo) return "The demo has a time limit of its own, which the workspace's settings do not change. Your own fixes run within the workspace's time limit for jobs (agent_config.max_minutes in the API, at most 120 minutes).";
+  if (demo) return "The demo has a time limit of its own, which the workspace's settings do not change. Your own fixes run within the time limit for jobs set in Settings \u2192 Workspace (up to 120 minutes).";
   const key = language ? `suites.${language}.test` : "the suites key";
-  return `Raise the workspace's time limit for jobs (agent_config.max_minutes of the workspace in the API, at most 120 minutes), or set ${key} in the repository's configuration file to a command that runs the tests these files need in less time, then start the fix again.`;
+  return `Raise the time limit for jobs in Settings \u2192 Workspace (up to 120 minutes), or set ${key} in the repository's configuration file to a command that runs the tests these files need in less time, then start the fix again.`;
 }
 function testsTimeRefusal(input2) {
   return {
@@ -210686,6 +210709,36 @@ function unitMentions(unit, names2) {
   return mentionsAny(unit.text, names2) || (unit.about ?? []).some((pattern) => names2.some((name) => ignorePatternCovers(pattern, name)));
 }
 
+// ../runner/src/tests/disk.ts
+import { statfsSync } from "node:fs";
+var SANDBOX_WORK_MOUNT = "/work";
+var SANDBOX_FILE_MOUNTS = [
+  SANDBOX_WORK_MOUNT,
+  "/cache",
+  "/home/loopback",
+  "/tmp"
+];
+var MIB = 1024 * 1024;
+function usedBytes(statfs, path6) {
+  try {
+    const s3 = statfs(path6);
+    const used = (s3.blocks - s3.bfree) * s3.bsize;
+    return Number.isFinite(used) && used >= 0 ? used : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function sandboxFilesMb(mode, statfs = statfsSync) {
+  if (mode !== "managed") return {};
+  const used = SANDBOX_FILE_MOUNTS.map((path6) => usedBytes(statfs, path6));
+  const work = used[SANDBOX_FILE_MOUNTS.indexOf(SANDBOX_WORK_MOUNT)];
+  const all = used.every((bytes) => bytes !== void 0) ? used.reduce((sum2, bytes) => sum2 + (bytes ?? 0), 0) : void 0;
+  return {
+    ...all !== void 0 ? { files_mb: Math.ceil(all / MIB) } : {},
+    ...work !== void 0 ? { work_mb: Math.ceil(work / MIB) } : {}
+  };
+}
+
 // ../runner/src/tests/partial.ts
 var MIN_CHUNK_MS = 15e3;
 var MAX_CHUNK_MS = 5 * 6e4;
@@ -214141,7 +214194,9 @@ async function verifyAndPropose(ctx, salvaging) {
             ran: state3.baseline.report.ran,
             passed: state3.baseline.report.passed,
             lazy: true,
-            timed_out: state3.baseline.timedOut === true
+            timed_out: state3.baseline.timedOut === true,
+            // Decision 121: the sandbox's files against its sampled memory peak (Managed only).
+            ...sandboxFilesMb(ctx.mode)
           });
           if (state3.baseline.timedOut) state3.baseline = void 0;
         }
@@ -214250,7 +214305,8 @@ async function verifyAndPropose(ctx, salvaging) {
   ctx.events.info("tests.finished", testsLine(tests).slice(0, 500), {
     ran: tests.ran,
     passed: tests.passed,
-    command: tests.command
+    command: tests.command,
+    ...sandboxFilesMb(ctx.mode)
   });
   if (ctx.engine.mode === "sdk") {
     const tsconfigAtBase = (await git2.run(["cat-file", "-e", `${base}:tsconfig.json`], { signal: ctx.signal })).exitCode === 0;
@@ -220273,7 +220329,9 @@ async function executeJob(options, jobId, credentials) {
               failing_total: baselineFailing.total,
               failing_complete: baselineFailing.complete
             } : {},
-            ...failingTests ? { failing_tests: failingTests } : {}
+            ...failingTests ? { failing_tests: failingTests } : {},
+            // Decision 121: the sandbox's files against its sampled memory peak (Managed only).
+            ...sandboxFilesMb(mode)
           }
         );
         if (baselineFailing) log2(`Failing on the base commit: ${failingLine(baselineFailing)}`);
@@ -220294,7 +220352,7 @@ async function executeJob(options, jobId, credentials) {
         const unavailable = (failure4) => {
           state3.stop = failure4;
           state3.unavailable = installFailureLine(failure4);
-          events.warn("tests.suite_baseline", `${headline}: ${state3.unavailable}`.slice(0, 500), { ecosystem: suite.ecosystem, scope: suite.scope, cause: failure4.diagnosis.cause, certain: state3.certain === true, named });
+          events.warn("tests.suite_baseline", `${headline}: ${state3.unavailable}`.slice(0, 500), { ecosystem: suite.ecosystem, scope: suite.scope, cause: failure4.diagnosis.cause, certain: state3.certain === true, named, ...sandboxFilesMb(mode) });
         };
         const tooLong = (detail2) => testsTimeRefusal({ what: headline, detail: detail2, maxMinutes, language: suite.ecosystem, demo: demoRun });
         if (own2?.problem) {
@@ -220306,7 +220364,7 @@ async function executeJob(options, jobId, credentials) {
         if (phaseBudget(spareMs(), rustBuildRun(suite) ? "build" : "run") < MIN_BASE_RUN_MS) {
           const detail2 = `no time was left for its run on the base commit before the agent, with ${Math.round(agentFloor / 6e4)} minutes kept for the agent`;
           state3.baseSkipped = true;
-          events.info("tests.suite_baseline", `${headline}: ${detail2}`, { ecosystem: suite.ecosystem, scope: suite.scope, skipped: true, certain: state3.certain === true, named });
+          events.info("tests.suite_baseline", `${headline}: ${detail2}`, { ecosystem: suite.ecosystem, scope: suite.scope, skipped: true, certain: state3.certain === true, named, ...sandboxFilesMb(mode) });
           if (named) refuseFix(tooLong(detail2));
           continue;
         }
@@ -220338,7 +220396,7 @@ async function executeJob(options, jobId, credentials) {
         }
         if (ran.kind === "too_long") {
           state3.unavailable = `${ran.detail}, and the job's time limit is ${payload2.limits.max_minutes} minutes`;
-          events.warn("tests.suite_baseline", `${headline}: ${state3.unavailable}`.slice(0, 500), { ecosystem: suite.ecosystem, scope: suite.scope, timed_out: true, build_ms: state3.buildMs ?? null, run_ms: state3.runMs ?? null, certain: state3.certain === true, named });
+          events.warn("tests.suite_baseline", `${headline}: ${state3.unavailable}`.slice(0, 500), { ecosystem: suite.ecosystem, scope: suite.scope, timed_out: true, build_ms: state3.buildMs ?? null, run_ms: state3.runMs ?? null, certain: state3.certain === true, named, ...sandboxFilesMb(mode) });
           if (named) refuseFix(tooLong(ran.detail));
           continue;
         }
@@ -220356,7 +220414,8 @@ async function executeJob(options, jobId, credentials) {
           estimate_ms: state3.estimateMs ?? null,
           certain: state3.certain === true,
           named: state3.named === true,
-          ...failing ? { failing: failing.names, failing_total: failing.total, failing_complete: failing.complete } : {}
+          ...failing ? { failing: failing.names, failing_total: failing.total, failing_complete: failing.complete } : {},
+          ...sandboxFilesMb(mode)
         });
       }
       const suitesPrepared = suiteStates.some((state3) => state3.baseline !== void 0);
@@ -220467,7 +220526,7 @@ async function executeJob(options, jobId, credentials) {
       events.info(
         "tests.finished",
         `${outcome.report.ran ? outcome.report.passed ? "passed" : "failed" : "not run"}: ${outcome.report.summary.split("\n")[0]?.slice(0, 300) ?? ""}`,
-        { ran: outcome.report.ran, passed: outcome.report.passed }
+        { ran: outcome.report.ran, passed: outcome.report.passed, ...sandboxFilesMb(mode) }
       );
       return outcome;
     };
